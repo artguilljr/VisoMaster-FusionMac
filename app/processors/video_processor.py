@@ -1891,6 +1891,43 @@ class VideoProcessor(QObject):
         Uses the actual display duration for FPS calculation if playback occurred.
         """
 
+        # Record an end-to-end benchmark locally without media paths or identities.
+        try:
+            if processing_time_sec > 0.01 and num_frames_processed > 0:
+                import json
+                import platform
+                import psutil
+
+                models = self.main_window.models_processor
+                report = {
+                    "schema": 1,
+                    "timestamp": datetime.now().astimezone().isoformat(),
+                    "platform": platform.system(),
+                    "architecture": platform.machine(),
+                    "device": str(getattr(models, "device", "unknown")),
+                    "providers": [
+                        p[0] if isinstance(p, (tuple, list)) else str(p)
+                        for p in getattr(models, "providers", [])
+                    ],
+                    "media_type": str(self.file_type),
+                    "frames_processed": int(num_frames_processed),
+                    "elapsed_seconds": round(processing_time_sec, 3),
+                    "end_to_end_fps": round(num_frames_processed / processing_time_sec, 3),
+                    "process_rss_mib_at_end": round(
+                        psutil.Process().memory_info().rss / (1024 ** 2), 1
+                    ),
+                    "system_memory_mib": round(psutil.virtual_memory().total / (1024 ** 2), 1),
+                }
+                report_dir = Path.home() / "VisoMasterBenchmarks"
+                report_dir.mkdir(parents=True, exist_ok=True)
+                report_path = report_dir / "processing_runs.jsonl"
+                with report_path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(report) + "\n")
+                print(f"[BENCHMARK] End-to-end FPS: {report['end_to_end_fps']}")
+                print(f"[BENCHMARK] Report: {report_path}")
+        except Exception as exc:
+            print(f"[WARN] Benchmark report unavailable: {exc}")
+
         # 1. Print formatted duration (overall processing time)
         formatted_duration = self._format_duration(processing_time_sec)
         print(f"\n[INFO] Processing completed in {formatted_duration}")

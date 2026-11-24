@@ -2,6 +2,7 @@ import os
 import math
 import json
 import subprocess
+import sys
 from typing import Dict, Any, Optional, Mapping, Tuple, List
 import numpy
 
@@ -17,6 +18,26 @@ class FFmpegEncoder:
         self.recording_sp: Optional[subprocess.Popen] = None
         self.frames_written: int = 0
         self._source_metrics_cache: Dict[str, Dict[str, Any]] = {}
+        self._encoder_probe_cache: Dict[tuple, bool] = {}
+
+    def _probe_encoder(self, width: int, height: int, fps: float, options: list) -> bool:
+        """Encode one generated frame before committing to a Mac recording."""
+        key = (os.environ.get("PATH", ""), width, height, fps, tuple(options))
+        if key not in self._encoder_probe_cache:
+            try:
+                result = subprocess.run(
+                    ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                     "-i", f"color=c=black:s={width}x{height}:r={fps}",
+                     "-frames:v", "1", *options, "-f", "null", "-"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                self._encoder_probe_cache[key] = result.returncode == 0
+                if result.returncode:
+                    print(f"[WARN] Encoder test failed: {result.stderr.strip()[-1500:]}")
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[WARN] Encoder test failed: {exc}")
+                self._encoder_probe_cache[key] = False
+        return self._encoder_probe_cache[key]
 
     @staticmethod
     def _parse_ffprobe_fps(rate_text: Any) -> Optional[float]:
@@ -301,6 +322,7 @@ class FFmpegEncoder:
             )
 
         # Video codec args
+        codec_start = len(args)
         if control.get("HDREncodeToggle"):
             args.extend(
                 [
@@ -316,6 +338,17 @@ class FFmpegEncoder:
                     f"crf={ffquality}:vbv-bufsize=10000:vbv-maxrate=10000:selective-sao=0:no-sao=1:strong-intra-smoothing=0:rect=0:aq-mode={int(control.get('FFSpatialAQToggle', 0))}:t-aq={int(control.get('FFTemporalAQToggle', 0))}:hdr-opt=1:repeat-headers=1:colorprim=bt2020:range=limited:transfer=smpte2084:colormatrix=bt2020nc:master-display='G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)':max-cll=1000,400",
                 ]
             )
+        elif sys.platform == "darwin":
+            # VideoToolbox uses 1..100 quality (higher is better), not NVENC CQ.
+            # This is an approximate mapping of the app's 0..51 quality slider.
+            vt_quality = max(1, min(100, round(100 - 100 * ffquality / 51)))
+            args.extend([
+                "-c:v", "hevc_videotoolbox", "-profile:v", "main10",
+                "-q:v", str(vt_quality), "-b:v", "0", "-allow_sw", "0",
+                "-pix_fmt", "p010le", "-colorspace", "bt709",
+                "-color_primaries", "bt709", "-color_trc", "bt709",
+                "-tag:v", "hvc1",
+            ])
         else:
             args.extend(
                 [
@@ -346,6 +379,7 @@ class FFmpegEncoder:
                 ]
             )
 
+        codec_end = len(args)
         target_matrix = "bt2020nc" if control.get("HDREncodeToggle") else "bt709"
         scale_params = f"in_range=pc:out_range=tv:out_color_matrix={target_matrix}"
 
@@ -358,6 +392,23 @@ class FFmpegEncoder:
             )
         else:
             args.extend(["-vf", f"scale={scale_params}"])
+
+        if sys.platform == "darwin":
+            if not self._probe_encoder(frame_width, frame_height, fps, args[codec_start:]):
+                if not control.get("HDREncodeToggle"):
+                    print("[WARN] VideoToolbox unavailable; trying CPU HEVC encoding.")
+                    args[codec_start:codec_end] = [
+                        "-c:v", "libx265", "-preset", "medium", "-crf", str(ffquality),
+                        "-pix_fmt", "yuv420p10le", "-colorspace", "bt709",
+                        "-color_primaries", "bt709", "-color_trc", "bt709", "-tag:v", "hvc1",
+                    ]
+                    if not self._probe_encoder(frame_width, frame_height, fps, args[codec_start:]):
+                        print("[ERROR] No usable HEVC encoder. Recording was not started.")
+                        return False
+                else:
+                    print("[ERROR] HDR encoder test failed. Recording was not started.")
+                    return False
+            print(f"[INFO] Recording encoder: {args[codec_start + 1]}")
 
         args.append(output_filename)
 

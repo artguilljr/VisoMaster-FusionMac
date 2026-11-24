@@ -49,3 +49,6 @@ colorama==0.4.6
 rich==13.8.1
 protobuf==4.25.5
 pyvirtualcam==0.12.1
+
+# Universal macOS wheel includes both ffmpeg and ffprobe.
+ffmpeg-binaries==1.1.0

@@ -585,6 +585,12 @@ class FaceDetectors:
             args["input_size"] = (
                 input_size  # Reverted back because some faces are not detected with the auto-resolved size.
             )
+            if detect_mode == "RetinaFace" and self.models_processor.provider_name == "CoreML":
+                # A fixed 512x512 CoreML sidecar cannot accept other detector sizes.
+                # The default and standard/VR worker calls all request 512 today.
+                shape = ort_session.get_inputs()[0].shape
+                if len(shape) == 4 and shape[2:4] == [512, 512]:
+                    args["input_size"] = (512, 512)
 
         # Run the detector — returns (det, kpss_5, kpss, det_scores)
         det, kpss_5, kpss, det_scores = detection_function(**args)

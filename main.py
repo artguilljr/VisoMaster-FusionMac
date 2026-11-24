@@ -5,6 +5,49 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+
+def _configure_bundled_ffmpeg() -> None:
+    """Prefer runnable, native pip-installed media tools on macOS."""
+    if sys.platform != "darwin":
+        return
+    import shutil
+    import subprocess
+
+    def working(name: str) -> bool:
+        executable = shutil.which(name)
+        if not executable:
+            return False
+        try:
+            return subprocess.run(
+                [executable, "-version"], capture_output=True, timeout=5
+            ).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    # A working `ffmpeg -version` does not imply this binary supports HEVC.
+    # Conda can put a minimal FFmpeg ahead of the pip binary in PATH.
+    original_path = os.environ.get("PATH", "")
+    try:
+        from portable_ffmpeg import get_ffmpeg
+
+        ffmpeg_path, ffprobe_path = map(Path, get_ffmpeg())
+        if ffmpeg_path.parent != ffprobe_path.parent:
+            raise RuntimeError("FFmpeg and FFprobe are in different directories")
+        directory = str(ffmpeg_path.parent)
+        os.environ["PATH"] = directory + os.pathsep + original_path
+        if not (working("ffmpeg") and working("ffprobe")):
+            raise RuntimeError("downloaded FFmpeg or FFprobe cannot run")
+        print(f"[INFO] Using pip FFmpeg tools: {directory}")
+    except (ImportError, OSError, RuntimeError) as exc:
+        os.environ["PATH"] = original_path
+        if working("ffmpeg") and working("ffprobe"):
+            print(f"[WARN] Pip FFmpeg tools unavailable ({exc}); using FFmpeg from PATH")
+        else:
+            print(f"[WARN] Pip FFmpeg tools unavailable: {exc}")
+
+
+_configure_bundled_ffmpeg()
+
 # --- PyTorch VRAM Optimization ---
 # MUST be set BEFORE importing torch (which occurs during _run_app).
 # Instructs the caching allocator to release unused memory segments back to the CUDA driver.

@@ -671,19 +671,20 @@ def getRotationMatrix2D(center, output_size, scale, rotation, is_clockwise=True)
 
 
 def invertAffineTransform(M):
-    """
-    t = trans.SimilarityTransform()
-    t.params[0:2] = M
-    IM = t.inverse.params[0:2, :]
+    """Invert a 2x3 affine transform without invoking a general BLAS solver."""
+    matrix = np.asarray(M, dtype=np.float64)
+    if matrix.shape != (2, 3) or not np.isfinite(matrix).all():
+        raise ValueError("Expected a finite 2x3 affine transform")
+    a, b, tx = matrix[0]
+    c, d, ty = matrix[1]
+    determinant = a * d - b * c
+    if determinant == 0 or not np.isfinite(determinant):
+        raise np.linalg.LinAlgError("Singular affine transform")
 
-    Returns a 2x3 affine matrix (the inverse), not the full 3x3 homogeneous form.
-    All callers should receive and use a 2x3 matrix.
-    """
-    M_H = np.vstack([M, np.array([0, 0, 1])])
-    IM = np.linalg.inv(M_H)
-
-    # F-02: return only the 2x3 affine rows, not the full 3x3 homogeneous matrix
-    return IM[0:2, :]
+    return np.array(
+        [[d, -b, b * ty - d * tx], [-c, a, c * tx - a * ty]],
+        dtype=np.float64,
+    ) / determinant
 
 
 def warp_face_by_bounding_box_for_landmark_68(img, bbox, input_size):

@@ -8,9 +8,10 @@
 #
 # First-time setup:
 #   uv venv --python 3.12 .venv
-#   uv pip install --python .venv/bin/python -r requirements_mac.txt
+#   uv pip install --python .venv/bin/python -r requirements_mac_arm64.txt  # Apple Silicon
+#   uv pip install --python .venv/bin/python -r requirements_mac.txt        # Intel
 #   .venv/bin/python download_models.py
-#   brew install ffmpeg
+#   Both macOS requirements files install FFmpeg and FFprobe through pip.
 
 set -euo pipefail
 
@@ -19,11 +20,6 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 if [[ ! -x .venv/bin/python ]]; then
     echo "[FATAL] .venv not found. Run the first-time setup in the header of this script." >&2
     exit 1
-fi
-
-if ! command -v ffmpeg >/dev/null 2>&1; then
-    echo "[WARN] ffmpeg not on PATH — recording and video export will fail." >&2
-    echo "       Install it with: brew install ffmpeg" >&2
 fi
 
 exec .venv/bin/python main.py "$@"

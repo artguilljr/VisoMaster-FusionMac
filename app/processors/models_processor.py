@@ -239,7 +239,11 @@ class ModelsProcessor(QtCore.QObject):
         # is both correct and, for those specific graphs, no slower.
         self.coreml_ep_options: Dict[str, Any] = {
             "ModelFormat": "MLProgram",
-            "MLComputeUnits": "ALL",
+            "MLComputeUnits": (
+                "CPUAndGPU"
+                if os.environ.get("VISOMASTER_COREML_GPU_ONLY") == "1"
+                else "ALL"
+            ),
             "RequireStaticInputShapes": "1",
             "AllowLowPrecisionAccumulationOnGPU": "1",
         }
@@ -317,6 +321,8 @@ class ModelsProcessor(QtCore.QObject):
         ``*.trtshape.onnx``. The cached file is reused unless the source ONNX is
         newer. For models not in the list, the original path is returned as-is.
         """
+        if self.provider_name not in ("TensorRT", "TensorRT-Engine"):
+            return onnx_path
         if model_name not in tensorrt_shape_infer_models:
             return onnx_path
         if not onnx_path.lower().endswith(".onnx"):
@@ -567,6 +573,69 @@ class ModelsProcessor(QtCore.QObject):
             # original path stays untouched for download/integrity checks.
             onnx_path = self._ensure_trt_ready_onnx(model_name, onnx_path)
 
+            inswapper_original_path = None
+            inswapper_compute_units = None
+            alphaface_compute_units = None
+            vgg_compute_units = None
+            if (self.provider_name == "CoreML"
+                    and model_name == "combo_relu3_3_relu3_1"
+                    and os.environ.get("VISOMASTER_VGG_OPTIMIZED") == "1"):
+                try:
+                    from app.processors.utils.coreml_vgg import approved_candidate as vgg_candidate
+
+                    approved = vgg_candidate(onnx_path)
+                    if approved:
+                        onnx_path, vgg_compute_units = approved
+                        print(f"[INFO] Using benchmark-approved VGG CoreML copy ({vgg_compute_units})")
+                    else:
+                        print("[WARN] No approved VGG copy. Run tools/prepare_vgg_mac.py first.")
+                except Exception as exc:
+                    print(f"[WARN] VGG optimization unavailable: {exc}")
+            if (self.provider_name == "CoreML" and model_name == "AlphaFace"
+                    and os.environ.get("VISOMASTER_ALPHAFACE_OPTIMIZED") == "1"):
+                try:
+                    from app.processors.utils.coreml_alphaface import approved_candidate as alpha_candidate
+
+                    approved = alpha_candidate(onnx_path)
+                    if approved:
+                        onnx_path, alphaface_compute_units = approved
+                        print(f"[INFO] Using benchmark-approved AlphaFace CoreML copy ({alphaface_compute_units})")
+                    else:
+                        print("[WARN] No approved AlphaFace copy. Run tools/profile_alphaface_mac.py first.")
+                except Exception as exc:
+                    print(f"[WARN] AlphaFace optimization unavailable: {exc}")
+            if (self.provider_name == "CoreML" and model_name == "Inswapper128"
+                    and os.environ.get("VISOMASTER_INSWAPPER_OPTIMIZED") == "1"):
+                try:
+                    from app.processors.utils.coreml_inswapper import approved_candidate
+
+                    approved = approved_candidate(onnx_path)
+                    if approved:
+                        inswapper_original_path = onnx_path
+                        onnx_path, inswapper_compute_units = approved
+                        print(f"[INFO] Using benchmark-approved Inswapper CoreML copy ({inswapper_compute_units})")
+                    else:
+                        print("[WARN] No approved Inswapper copy. Run tools/prepare_inswapper_mac.py first.")
+                except Exception as exc:
+                    print(f"[WARN] Inswapper optimization unavailable: {exc}")
+
+            # Opt-in on Apple Silicon. Fixed shapes let CoreML claim substantially
+            # more of RetinaFace and ArcFace; keep original model as fallback.
+            coreml_original_path = None
+            if (
+                self.provider_name == "CoreML"
+                and os.environ.get("VISOMASTER_COREML_STATIC") == "1"
+                and model_name in ("RetinaFace", "Inswapper128ArcFace")
+            ):
+                try:
+                    from app.processors.utils.coreml_static_cache import static_copy
+
+                    candidate = static_copy(model_name, onnx_path)
+                    coreml_original_path, onnx_path = onnx_path, candidate
+                    print(f"[INFO] Testing fixed-shape CoreML model: {model_name}")
+                except Exception as exc:
+                    print(f"[WARN] Fixed-shape {model_name} unavailable: {exc}")
+
             build_was_triggered = (
                 False  # MP-05: flag to track if build dialog was shown
             )
@@ -590,7 +659,8 @@ class ModelsProcessor(QtCore.QObject):
             # Check if the model is explicitly marked as safe for FP16 in models_data.py
             if model_name in fp16_safe_models_list:
                 model_trt_options["trt_fp16_enable"] = True
-                print(f"[INFO] FP16 Acceleration ENABLED for {model_name}")
+                if self.provider_name in ("TensorRT", "TensorRT-Engine"):
+                    print(f"[INFO] TensorRT FP16 Acceleration ENABLED for {model_name}")
             else:
                 model_trt_options["trt_fp16_enable"] = False
 
@@ -607,6 +677,16 @@ class ModelsProcessor(QtCore.QObject):
                     )
                 else:
                     model_providers.append(p)
+
+            if any(x is not None for x in (inswapper_compute_units, alphaface_compute_units, vgg_compute_units)):
+                model_providers = [
+                    ("CoreMLExecutionProvider", {
+                        **self.coreml_ep_options,
+                        "MLComputeUnits": inswapper_compute_units or alphaface_compute_units or vgg_compute_units,
+                        "AllowLowPrecisionAccumulationOnGPU": "0",
+                    }),
+                    "CPUExecutionProvider",
+                ]
 
             is_tensorrt_load = any(
                 (p[0] if isinstance(p, tuple) else p) == "TensorrtExecutionProvider"
@@ -753,6 +833,11 @@ class ModelsProcessor(QtCore.QObject):
                 if session_options is None:
                     session_options = onnxruntime.SessionOptions()
 
+                if any(x is not None for x in (inswapper_compute_units, alphaface_compute_units, vgg_compute_units)):
+                    session_options.intra_op_num_threads = 2
+                    session_options.inter_op_num_threads = 1
+                    session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+
                 # Force log_severity_level to 3 (ERROR) for the actual load as well, to suppress non-critical warnings from ONNX Runtime that can clutter the console.
                 session_options.log_severity_level = 3
 
@@ -761,6 +846,35 @@ class ModelsProcessor(QtCore.QObject):
                     sess_options=session_options,
                     providers=model_providers,
                 )
+
+                if coreml_original_path is not None:
+                    try:
+                        size = 512 if model_name == "RetinaFace" else 112
+                        reference = onnxruntime.InferenceSession(
+                            coreml_original_path, providers=["CPUExecutionProvider"]
+                        )
+                        inputs = reference.get_inputs()
+                        if len(inputs) != 1:
+                            raise ValueError("Unexpected model input count")
+                        sample = np.random.default_rng(1234).random(
+                            (1, 3, size, size)
+                        ).astype(np.float32)
+                        baseline = reference.run(None, {inputs[0].name: sample})
+                        accelerated = model_instance.run(None, {inputs[0].name: sample})
+                        if len(baseline) != len(accelerated) or any(
+                            a.shape != b.shape
+                            or not np.allclose(a, b, rtol=0.01, atol=0.001)
+                            for a, b in zip(baseline, accelerated)
+                        ):
+                            raise ValueError("CPU/CoreML results differ")
+                        print(f"[INFO] Fixed-shape CoreML validation passed: {model_name}")
+                    except Exception as exc:
+                        print(f"[WARN] Fixed-shape {model_name} failed validation ({exc}); using original")
+                        model_instance = onnxruntime.InferenceSession(
+                            coreml_original_path,
+                            sess_options=session_options,
+                            providers=model_providers,
+                        )
 
                 # This ensures the CUDA context is synchronized after a new TRT
                 # engine build, before we try to load it.
@@ -803,6 +917,35 @@ class ModelsProcessor(QtCore.QObject):
                 # This catch is still valuable for non-fatal errors
                 print(f"[ERROR] Failed to load model {model_name} (even after probe).")
                 traceback.print_exc()
+                if inswapper_original_path is not None:
+                    try:
+                        model_instance = onnxruntime.InferenceSession(
+                            inswapper_original_path, sess_options=session_options,
+                            providers=self.providers,
+                        )
+                        graph = onnx.load(self.models_path[model_name]).graph
+                        initializer = next(
+                            (value for value in graph.initializer if value.name == "emap"),
+                            graph.initializer[-1],
+                        )
+                        self.emap = onnx.numpy_helper.to_array(initializer)
+                        self.models[model_name] = model_instance
+                        print("[WARN] Using original Inswapper model after candidate load failure")
+                        return model_instance
+                    except Exception:
+                        traceback.print_exc()
+                if coreml_original_path is not None:
+                    try:
+                        model_instance = onnxruntime.InferenceSession(
+                            coreml_original_path,
+                            sess_options=session_options,
+                            providers=model_providers,
+                        )
+                        self.models[model_name] = model_instance
+                        print(f"[WARN] Using original {model_name} model instead")
+                        return model_instance
+                    except Exception:
+                        traceback.print_exc()
                 if model_instance is not None:
                     del model_instance
                     gc.collect()

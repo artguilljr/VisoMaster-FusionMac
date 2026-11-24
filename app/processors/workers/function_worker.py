@@ -1,9 +1,12 @@
 from contextlib import contextmanager
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
+import os
 import torch
 import threading
+import time
 
 
 # --- Internal Sub-Processor Imports ---
@@ -54,6 +57,11 @@ class FunctionWorker:
         self._ort_gate_readers = 0
         self._ort_gate_writer_active = False
         self._ort_gate_writers_waiting = 0
+        # Opt-in aggregate wall-clock measurements; disabled for normal renders.
+        self._profile_models = os.environ.get("VISOMASTER_PROFILE_MODELS") == "1"
+        self._profile_lock = threading.Lock()
+        self._profile_totals = defaultdict(lambda: [0, 0.0, 0.0, 0.0])
+        self._profile_calls = 0
 
         # Initialize Sub-Processors centrally.
         # We pass `self.mp` for VRAM management, and `self` so they can route calls through this Facade.
@@ -120,11 +128,17 @@ class FunctionWorker:
             self.mp.syncvec.cpu()
 
         exclusive = self.mp.models.get("GFPGANv1.4") is session
+        if self._profile_models:
+            gate_start = time.perf_counter()
 
         # 2. Keep GFPGAN isolated from every other ORT/TensorRT inference.
         with self._ort_inference_gate(exclusive):
+            if self._profile_models:
+                gate_acquired = time.perf_counter()
             # 3. INFERENCE AND CORRECT POST-SYNC (Inside the session lock)
             with session_lock:
+                if self._profile_models:
+                    run_start = time.perf_counter()
                 # Execute ONNX Runtime / TensorRT.
                 session.run_with_iobinding(io_binding)
 
@@ -134,6 +148,26 @@ class FunctionWorker:
                 # This guarantees ORT is completely finished writing the pre-allocated output tensors
                 # before we release the locks to the next worker thread.
                 io_binding.synchronize_outputs()
+                if self._profile_models:
+                    run_end = time.perf_counter()
+
+        if self._profile_models:
+            model_name = next((name for name, loaded in self.mp.models.items()
+                               if loaded is session), "Other")
+            with self._profile_lock:
+                result = self._profile_totals[model_name]
+                result[0] += 1
+                result[1] += (gate_acquired - gate_start) * 1000
+                result[2] += (run_start - gate_acquired) * 1000
+                result[3] += (run_end - run_start) * 1000
+                self._profile_calls += 1
+                if self._profile_calls % 150 == 0:
+                    summary = sorted(self._profile_totals.items(),
+                                     key=lambda item: item[1][3], reverse=True)
+                    print("[PROFILE] ONNX model totals (calls; gate wait / session wait / inference ms):", flush=True)
+                    for name, (count, gate_ms, lock_ms, run_ms) in summary[:12]:
+                        print(f"[PROFILE] {name}: {count}; {gate_ms:.0f} / "
+                              f"{lock_ms:.0f} / {run_ms:.0f}", flush=True)
 
     # --- Models Unloaders ---
 

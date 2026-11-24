@@ -1335,6 +1335,10 @@ class MediaPipeline(QObject):
                     print(
                         f"[WARN] Error writing frame {frame_number_to_display} to FFmpeg encoder during {log_prefix}."
                     )
+                    self.vp.fatal_processing_error_signal.emit(
+                        f"FFmpeg failed while recording frame {frame_number_to_display}. See the encoder error in Terminal."
+                    )
+                    return
             else:
                 log_prefix = (
                     f"segment {self.vp.current_segment_index + 1}"
@@ -1344,6 +1348,10 @@ class MediaPipeline(QObject):
                 print(
                     f"[WARN] FFmpeg encoder not available for {log_prefix} when trying to write frame {frame_number_to_display}."
                 )
+                self.vp.fatal_processing_error_signal.emit(
+                    f"FFmpeg exited before recording frame {frame_number_to_display}. See the encoder error in Terminal."
+                )
+                return
 
         if self.vp.file_type != "webcam":
             if frame_number_to_display in self.main_window.markers:
